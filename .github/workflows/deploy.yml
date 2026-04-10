@@ -398,6 +398,21 @@ jobs:
             # Update existing Container App
             echo "Updating existing Container App..."
             
+            # Re-apply AcrPull role and registry config (idempotent — safe to repeat)
+            CA_IDENTITY=$(az containerapp show --name "$CA_NAME" --resource-group ${{ env.RESOURCE_GROUP }} --query "identity.principalId" -o tsv)
+            echo "Managed Identity Principal ID: $CA_IDENTITY"
+            ACR_ID=$(az acr show --name "$ACR_NAME" --resource-group ${{ env.RESOURCE_GROUP }} --query "id" -o tsv)
+            az role assignment create --assignee "$CA_IDENTITY" --role "AcrPull" --scope "$ACR_ID" --output none 2>/dev/null || true
+            echo "AcrPull role ensured for managed identity"
+            az containerapp registry set \
+              --name "$CA_NAME" \
+              --resource-group "${{ env.RESOURCE_GROUP }}" \
+              --server "$ACR_LOGIN_SERVER" \
+              --identity system \
+              --output none
+            echo "Registry identity confirmed. Waiting 90s for RBAC propagation..."
+            sleep 90
+            
             # Fetch current credentials to ensure env vars are up-to-date
             echo "Fetching service credentials..."
             
