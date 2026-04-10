@@ -363,8 +363,14 @@ jobs:
                 --timeout "$BUILD_TIMEOUT" \
                 ../
               local build_rc=$?
-              echo "Re-locking ACR firewall..."
-              az acr update --name "$ACR_NAME" --default-action Deny --only-show-errors
+              # Only re-lock ACR when private endpoints are enabled (VNet-integrated Container Apps
+              # can still pull via private endpoint; public deployments need ACR open for pulls)
+              if [ "$ENABLE_PE" == "true" ]; then
+                echo "Re-locking ACR firewall (private endpoints mode)..."
+                az acr update --name "$ACR_NAME" --default-action Deny --only-show-errors
+              else
+                echo "Leaving ACR firewall open (no private endpoints — Container Apps need public access to pull)"
+              fi
               return $build_rc
             fi
           }
