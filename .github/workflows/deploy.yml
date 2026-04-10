@@ -791,12 +791,12 @@ jobs:
             ENABLE_PE="false"
           fi
           
-          # Determine SKU: S1 required for VNet integration, F1 otherwise
+          # Determine SKU: S1 required for VNet integration, B1 otherwise
           if [ "$ENABLE_PE" == "true" ]; then
             SKU="S1"
             echo "  Private endpoints enabled — using S1 SKU for VNet integration"
           else
-            SKU="F1"
+            SKU="B1"
           fi
           
           # Create Web App if it doesn't exist
