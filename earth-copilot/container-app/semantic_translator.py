@@ -2067,7 +2067,7 @@ Format: ["collection-id"]"""
         # ========================================================================
         
         # HLS (Harmonized Landsat Sentinel) - check BEFORE Landsat since name contains "landsat"
-        if any(k in query_lower for k in ["hls", "harmonized landsat sentinel", "harmonized landsat"]):
+        if any(k in query_lower for k in ["hls", "harmonized landsat", "harmonized sentinel", "hls2"]):
             logger.info(f"[FAST] HLS DETECTED in query")
             if "s30" in query_lower:
                 return ["hls2-s30"]
@@ -2075,8 +2075,8 @@ Format: ["collection-id"]"""
                 return ["hls2-l30"]
             return ["hls2-l30", "hls2-s30"]  # Both if unspecified
         
-        # Landsat - check for Level 1 vs Level 2
-        if "landsat" in query_lower:
+        # Landsat - check for Level 1 vs Level 2 (skip if HLS already matched above)
+        if "landsat" in query_lower and "harmonized" not in query_lower:
             logger.info(f"[FAST] LANDSAT DETECTED in query")
             # Level 1 indicators
             if any(k in query_lower for k in ["level 1", "level-1", "l1", "c2-l1", "c2 l1"]):
