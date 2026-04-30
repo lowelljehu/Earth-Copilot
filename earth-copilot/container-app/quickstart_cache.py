@@ -27,4 +27,12 @@ def get_quickstart_location(query: str) -> Optional[dict]:
 
 def get_quickstart_stats() -> dict:
     """Return stats about the quickstart cache."""
-    return {"total_cached_queries": len(QUICKSTART_QUERIES)}
+    collections: set = set()
+    for entry in QUICKSTART_QUERIES.values():
+        if isinstance(entry, dict):
+            for col in entry.get("collections", []):
+                collections.add(col)
+    return {
+        "total_queries": len(QUICKSTART_QUERIES),
+        "collections_covered": list(collections),
+    }
