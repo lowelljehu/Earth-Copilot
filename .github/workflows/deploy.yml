@@ -725,7 +725,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: earth-copilot/web-ui/package-lock.json
 
@@ -841,7 +841,7 @@ jobs:
               --name "$WA_NAME" \
               --resource-group "${{ env.RESOURCE_GROUP }}" \
               --plan "$ASP_NAME" \
-              --runtime "NODE:20-lts" \
+              --runtime "NODE:22-lts" \
               --output none
             
             echo "  Created Web App: $WA_NAME"
@@ -852,7 +852,7 @@ jobs:
               --resource-group "${{ env.RESOURCE_GROUP }}" \
               --settings \
                 SCM_DO_BUILD_DURING_DEPLOYMENT=false \
-                WEBSITE_NODE_DEFAULT_VERSION=~20 \
+                WEBSITE_NODE_DEFAULT_VERSION=~22 \
                 VITE_API_BASE_URL="${{ steps.get-backend-url.outputs.backend_url }}" \
                 PORT=8080 \
               --output none
