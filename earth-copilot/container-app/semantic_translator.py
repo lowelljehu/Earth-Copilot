@@ -7917,8 +7917,16 @@ Keep your response focused, informative, and directly relevant to the user's que
             # Prepare data summary as formatted text for the LLM
             formatted_data_summary = self._format_data_summary_for_llm(data_summary)
             
-            # Execute using SK 1.36.2 invoke_prompt
+            # Execute using SK 1.36.2 invoke_prompt — use fast model (gpt-4o-mini) for response
+            # generation: the template provides all structure, so the model just fills in text.
+            from semantic_kernel.connectors.ai.open_ai.prompt_execution_settings.azure_chat_prompt_execution_settings import AzureChatPromptExecutionSettings
+            _resp_settings = AzureChatPromptExecutionSettings(
+                service_id="chat-completion-4o",  # Fast model (gpt-4o-mini) — saves ~1-2s
+                temperature=0.7,
+                max_completion_tokens=600
+            )
             arguments = KernelArguments(
+                settings=_resp_settings,
                 user_query=user_query,
                 data_summary=formatted_data_summary,
                 conversation_context=conversation_context or "No previous conversation context."

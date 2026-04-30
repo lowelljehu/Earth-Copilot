@@ -664,6 +664,8 @@ async def startup_event():
             global_translator = semantic_translator  # For session management
             SEMANTIC_KERNEL_AVAILABLE = True
             logger.info("[OK] Earth Copilot API initialized successfully with Semantic Translator (API Key)")
+            import asyncio as _asyncio
+            _asyncio.create_task(semantic_translator._ensure_kernel_initialized())
         # Try managed identity if endpoint provided but no API key
         elif azure_openai_endpoint and use_managed_identity:
             try:
@@ -683,6 +685,10 @@ async def startup_event():
                 global_translator = semantic_translator  # For session management
                 SEMANTIC_KERNEL_AVAILABLE = True
                 logger.info("[OK] Earth Copilot API initialized successfully with Semantic Translator (Managed Identity)")
+                # Warm the Semantic Kernel in the background so the first request doesn't
+                # pay the lazy-init cost (~500ms).
+                import asyncio as _asyncio
+                _asyncio.create_task(semantic_translator._ensure_kernel_initialized())
             except Exception as e:
                 logger.error(f"[FAIL] Failed to initialize with managed identity: {e}")
                 logger.warning("[WARN] Running in limited mode - no Azure OpenAI access")
@@ -3007,7 +3013,16 @@ async def unified_query_processor(request: Request):
                             logger.info(f"   Datetime: {stac_params['datetime']}")
                     else:
                         # Use the semantic translator's translate_query method with pin and session_bbox fallback
-                        stac_params = await translator.translate_query(natural_query, pin_location=pin, session_bbox=session_bbox)
+                        # Pass the RouterAgent's intent classification to skip the redundant second LLM call
+                        # inside translate_query (saves ~1s per STAC query)
+                        pre_classified = classification.get("intent_type") if classification else None
+                        stac_params = await translator.translate_query(
+                            natural_query,
+                            pin_location=pin,
+                            session_bbox=session_bbox,
+                            skip_intent_classification=bool(pre_classified),
+                            pre_classified_intent=pre_classified
+                        )
                     
                     # ========================================================================
                     # [ALERT] LOCATION VALIDATION: Check if location is required but missing
