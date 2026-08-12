@@ -107,13 +107,24 @@ class ContextualAgent:
 
         try:
             client = self._get_client()
-            # NOTE: temperature intentionally omitted. gpt-5 reasoning
-            # deployments only accept the default temperature (1); passing
-            # any other value returns HTTP 400 and bubbles up as the
-            # user-visible "LLM call failed" sentinel.
+            # Model-aware kwargs: gpt-5 / o-series reasoning models reject
+            # `temperature` (only default=1 supported) but accept
+            # `reasoning_effort`. Without capping reasoning_effort, gpt-5
+            # burns many hidden reasoning tokens even on simple factual
+            # questions -- measured adding ~10-15s of latency to plain
+            # "what is NDVI"-style questions. Mirrors the same model-aware
+            # pattern used by LoadAgent / ClarifierAgent / CollectionSelector.
+            model_lc = (self.deployment or "").lower()
+            is_reasoning = model_lc.startswith(("gpt-5", "o1", "o3", "o4"))
+            extra: dict = {}
+            if is_reasoning:
+                extra["reasoning_effort"] = "minimal"
+            else:
+                extra["temperature"] = 0.3
             resp = await client.chat.completions.create(
                 model=self.deployment,
                 messages=messages,
+                **extra,
             )
             answer = resp.choices[0].message.content or ""
         except Exception as exc:  # noqa: BLE001

@@ -118,13 +118,18 @@ class ClarifierAgent:
             "AZURE_OPENAI_CLARIFIER_DEPLOYMENT",
             os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5"),
         )
-        self.endpoint = endpoint or os.getenv(
-            "AZURE_AI_PROJECT_ENDPOINT"
-        ) or os.getenv("AZURE_OPENAI_ENDPOINT")
+        # NOTE: ClarifierAgent talks to AzureOpenAI's plain chat-completions
+        # API (not the Agent Service), so it must use the Cognitive
+        # Services endpoint/token audience, not AZURE_AI_PROJECT_ENDPOINT
+        # (an ai.azure.com Agent Service project endpoint used elsewhere,
+        # e.g. by AnalystAgent). Using the project endpoint here caused a
+        # silent 401 "audience is incorrect (https://ai.azure.com)" on
+        # every greeting/identity short-circuit -- the code fell back to
+        # a static passthrough on error, which masked the failure.
+        self.endpoint = endpoint or os.getenv("AZURE_OPENAI_ENDPOINT")
         if not self.endpoint:
             raise ValueError(
-                "ClarifierAgent requires AZURE_AI_PROJECT_ENDPOINT or "
-                "AZURE_OPENAI_ENDPOINT to be set."
+                "ClarifierAgent requires AZURE_OPENAI_ENDPOINT to be set."
             )
         self.api_version = api_version
         self._client: Optional[AsyncAzureOpenAI] = None
@@ -155,13 +160,26 @@ class ClarifierAgent:
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
-    async def decide(self, payload: ClarifierInput) -> ClarifierDecision:
+    async def decide(
+        self, payload: ClarifierInput, model: Optional[str] = None
+    ) -> ClarifierDecision:
         """
         Run the clarifier prompt and return a ClarifierDecision.
+
+        Args:
+            payload: The clarifier input.
+            model: Optional per-call model override (the frontend's
+                model selector). Falls back to ``self.deployment`` (the
+                env-configured default) when not given, preserving prior
+                behavior for callers that don't pass one. This mirrors
+                the fix already applied to AnalystAgent.run(model=...) --
+                without it, the greeting/identity short-circuit silently
+                ignored the user's model selection.
 
         Falls back to a deterministic passthrough on any error so the
         request keeps working even if the LLM is unreachable.
         """
+        _deployment = model or self.deployment
         try:
             pin_lat_lng = (
                 f"({payload.pin_lat:.4f}, {payload.pin_lng:.4f})"
@@ -183,8 +201,13 @@ class ClarifierAgent:
             )
 
             client = self._get_client()
+            _model_lc = (_deployment or "").lower()
+            _is_reasoning = _model_lc.startswith(("gpt-5", "o1", "o3", "o4"))
+            _sampling_kwargs = (
+                {"reasoning_effort": "minimal"} if _is_reasoning else {"temperature": 0.0}
+            )
             response = await client.chat.completions.create(
-                model=self.deployment,
+                model=_deployment,
                 messages=[
                     {"role": "system", "content": CLARIFIER_SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
@@ -193,8 +216,7 @@ class ClarifierAgent:
                     "type": "json_schema",
                     "json_schema": CLARIFIER_DECISION_SCHEMA,
                 },
-                temperature=0.0,
-                reasoning_effort="minimal",
+                **_sampling_kwargs,
             )
 
             content = response.choices[0].message.content or "{}"

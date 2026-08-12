@@ -72,8 +72,10 @@ class AnalystAgent:
     def __init__(self) -> None:
         self._agents_client = None
         self._agent_id: Optional[str] = None
+        self._current_model: Optional[str] = None
         self._initialized = False
         self._init_lock = asyncio.Lock()
+        self._model_lock = asyncio.Lock()
         self._threads: Dict[str, AnalystThread] = {}
         self._max_init_retries = 2
         logger.info("AnalystAgent created (lazy init on first use)")
@@ -113,7 +115,7 @@ class AnalystAgent:
             assert last_error is not None
             raise last_error
 
-    async def _do_initialize(self) -> None:
+    async def _do_initialize(self, model: Optional[str] = None) -> None:
         if not _AZURE_AVAILABLE:
             raise RuntimeError("azure.identity not installed")
 
@@ -123,7 +125,11 @@ class AnalystAgent:
         endpoint = os.getenv("AZURE_AI_PROJECT_ENDPOINT") or os.getenv(
             "AZURE_OPENAI_ENDPOINT"
         )
-        deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5")
+        # `model` is the user-selected deployment (from the frontend's model
+        # selector, threaded in via AnalyzeAgent.run -> AnalystAgent.run).
+        # Falls back to the env-configured default when no selection was
+        # made, preserving prior behavior for callers that don't pass one.
+        deployment = model or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5")
         if not endpoint:
             raise ValueError(
                 "AZURE_AI_PROJECT_ENDPOINT or AZURE_OPENAI_ENDPOINT must be set"
@@ -140,16 +146,103 @@ class AnalystAgent:
         toolset.add(functions)
         self._agents_client.enable_auto_function_calls(toolset)
 
-        agent = await self._agents_client.create_agent(
-            model=deployment,
-            name="PlanetaryExplorerAnalyst",
-            instructions=ANALYST_AGENT_INSTRUCTIONS,
-            toolset=toolset,
-        )
+        agent = await self._create_agent_capped(deployment, ANALYST_AGENT_INSTRUCTIONS, toolset)
         self._agent_id = agent.id
+        self._current_model = deployment
         self._initialized = True
         logger.info(
             "AnalystAgent initialized: agent_id=%s model=%s", agent.id, deployment
+        )
+
+    async def _ensure_model(self, model: Optional[str]) -> None:
+        """Ensure the live agent definition uses ``model``, if given.
+
+        AnalystAgent is a long-lived singleton whose Azure AI Agent Service
+        agent definition is created once (model baked in at creation time).
+        Unlike ``semantic_translator.set_model()`` -- which just resets a
+        Semantic Kernel wrapper and lazily rebuilds it -- the Agent Service
+        SDK binds ``model`` at ``create_agent()`` time, so switching models
+        means recreating the agent definition.
+
+        Threads are NOT tied to a specific agent definition (a thread_id is
+        passed alongside agent_id on every run), so recreating the agent
+        preserves all existing per-session conversation threads -- this is
+        cheap (a single API call) and doesn't lose any session state.
+
+        No-op when ``model`` is falsy or already matches the live agent, so
+        the common case (no selection made, or same model as last turn)
+        costs nothing.
+        """
+        if not model:
+            return
+        await self._ensure_initialized()
+        if model == self._current_model:
+            return
+        async with self._model_lock:
+            if model == self._current_model:
+                return
+            from .analyst_prompt import ANALYST_AGENT_INSTRUCTIONS
+            from .tools import create_analyst_functions
+            from azure.ai.agents.models import AsyncFunctionTool, AsyncToolSet  # type: ignore
+
+            logger.info(
+                "[ANALYST] Switching model %s -> %s (recreating agent, threads preserved)",
+                self._current_model, model,
+            )
+            functions = AsyncFunctionTool(create_analyst_functions())
+            toolset = AsyncToolSet()
+            toolset.add(functions)
+            self._agents_client.enable_auto_function_calls(toolset)  # type: ignore[union-attr]
+            agent = await self._create_agent_capped(model, ANALYST_AGENT_INSTRUCTIONS, toolset)
+            self._agent_id = agent.id
+            self._current_model = model
+
+    async def _create_agent_capped(self, model: str, instructions: str, toolset):
+        """Create an Agent Service agent, capping reasoning effort for gpt-5-
+        family models when possible.
+
+        The Agents SDK's ``create_agent`` does not document a
+        ``reasoning_effort`` parameter the way the plain chat.completions
+        API does (see ContextualAgent/LoadAgent/etc., which already cap
+        this on gpt-5 for latency). Since the underlying REST API is built
+        on the same schema family as the Assistants/Responses API, it may
+        still accept the field as an undocumented passthrough -- but this
+        is unverified, so we try it and transparently fall back to
+        creating the agent without it if the service/SDK rejects the
+        extra kwarg. Never raises solely because of this attempt.
+        """
+        model_lc = (model or "").lower()
+        is_reasoning = model_lc.startswith(("gpt-5", "o1", "o3", "o4"))
+        if is_reasoning:
+            try:
+                return await self._agents_client.create_agent(  # type: ignore[union-attr]
+                    model=model,
+                    name="PlanetaryExplorerAnalyst",
+                    instructions=instructions,
+                    toolset=toolset,
+                    reasoning_effort="minimal",
+                )
+            except TypeError:
+                # SDK's typed signature rejects the kwarg outright (no
+                # passthrough support at all in this SDK version).
+                logger.info(
+                    "[ANALYST] reasoning_effort not supported by installed "
+                    "azure-ai-agents SDK version -- creating agent without it"
+                )
+            except Exception as exc:
+                # Service-side rejection (e.g. unknown field in request
+                # body) surfaces as an HTTP error from the SDK, not a
+                # TypeError -- catch broadly here so a latency-cap attempt
+                # never breaks agent creation.
+                logger.info(
+                    "[ANALYST] reasoning_effort rejected by service (%s) -- "
+                    "creating agent without it", exc,
+                )
+        return await self._agents_client.create_agent(  # type: ignore[union-attr]
+            model=model,
+            name="PlanetaryExplorerAnalyst",
+            instructions=instructions,
+            toolset=toolset,
         )
 
     # ------------------------------------------------------------------
@@ -171,12 +264,19 @@ class AnalystAgent:
     # Main entry
     # ------------------------------------------------------------------
 
-    async def run(self, request) -> "SynthesizedResponse":
+    async def run(self, request, model: Optional[str] = None) -> "SynthesizedResponse":
         """Run the ReAct loop for a single AnalysisRequest.
 
         Returns a SynthesizedResponse that's drop-in compatible with the
         old Orchestrator + Synthesizer output (so layer1_agents.AnalyzeAgent
         doesn't need to change its caller contract).
+
+        Args:
+            model: Optional user-selected deployment name (from the
+                frontend model selector). When given and different from
+                the live agent's current model, the agent definition is
+                recreated on this model before the run -- see
+                ``_ensure_model``.
         """
         from pipeline.contracts import (
             AnalysisPlan,
@@ -187,6 +287,7 @@ class AnalystAgent:
         from .session_context import AnalystSession, clear_session, get_session, set_session
 
         started = time.time()
+        await self._ensure_model(model)
 
         # Populate the ContextVar so tools see the session.
         # ``use_graphrag`` / ``stac_mode`` ride on the request via the
@@ -217,12 +318,13 @@ class AnalystAgent:
         set_session(sess)
 
         try:
-            answer, tool_calls, evidence = await self._invoke_agent_service(request)
+            answer, tool_calls, evidence, skill_pack_id = await self._invoke_agent_service(request)
         except Exception as e:
             logger.exception("[ANALYST] run failed, returning fallback response")
             answer = self._fallback_answer(request, str(e))
             tool_calls = []
             evidence = []
+            skill_pack_id = None
 
         # Aggregate sources from tool evidence
         sources: List[Source] = []
@@ -251,6 +353,9 @@ class AnalystAgent:
 
         if clarify_payload:
             structured_by_tool["clarify"] = clarify_payload
+
+        if skill_pack_id:
+            structured_by_tool["skill_pack"] = {"id": skill_pack_id}
 
         # Build a degenerate plan record for back-compat with callers that
         # still serialize ``plan``. The plan is just the sequence of tools
@@ -298,6 +403,21 @@ class AnalystAgent:
 
         augmented = self._build_message(request)
 
+        # Skill pack: pick 0-1 domain guidance packs matching this question
+        # and inject as additional_instructions for this run only -- pure
+        # prompt augmentation, no new tools, no model change. Mirrors the
+        # identical mechanism in EnhancedVisionAgent.analyze().
+        skill_instructions = None
+        skill_pack_id = None
+        try:
+            from skills.skill_selector import select_skill_pack, render_skill_block
+            pack = select_skill_pack(request.question, applies_to="analyst_agent")
+            if pack:
+                skill_instructions = render_skill_block(pack)
+                skill_pack_id = pack.id
+        except Exception as skill_exc:
+            logger.warning("[SKILLS] Selection failed (continuing without): %s", skill_exc)
+
         run = None
         for attempt in range(3):
             try:
@@ -317,6 +437,7 @@ class AnalystAgent:
                 run = await self._agents_client.runs.create_and_process(
                     thread_id=thread.thread_id,
                     agent_id=self._agent_id,
+                    additional_instructions=skill_instructions,
                 )
                 break
             except Exception as e:
@@ -359,7 +480,7 @@ class AnalystAgent:
         # Tools recorded their results on the session ContextVar
         from .session_context import get_session
         evidence = list(get_session().evidence)
-        return answer, tool_calls, evidence
+        return answer, tool_calls, evidence, skill_pack_id
 
     # ------------------------------------------------------------------
     # Helpers
