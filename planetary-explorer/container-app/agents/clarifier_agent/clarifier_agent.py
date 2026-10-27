@@ -202,10 +202,15 @@ class ClarifierAgent:
 
             client = self._get_client()
             _model_lc = (_deployment or "").lower()
-            _is_reasoning = _model_lc.startswith(("gpt-5", "o1", "o3", "o4"))
-            _sampling_kwargs = (
-                {"reasoning_effort": "minimal"} if _is_reasoning else {"temperature": 0.0}
-            )
+            # Per-family effort value: gpt-5-family models accept "minimal";
+            # o-series (o1/o3/o4) models only accept "low"/"medium"/"high"
+            # and reject "minimal" with an HTTP 400 (PR #31 review finding).
+            if _model_lc.startswith("gpt-5"):
+                _sampling_kwargs = {"reasoning_effort": "minimal"}
+            elif _model_lc.startswith(("o1", "o3", "o4")):
+                _sampling_kwargs = {"reasoning_effort": "low"}
+            else:
+                _sampling_kwargs = {"temperature": 0.0}
             response = await client.chat.completions.create(
                 model=_deployment,
                 messages=[

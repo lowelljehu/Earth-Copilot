@@ -71,12 +71,21 @@ class AnalystAgent:
 
     def __init__(self) -> None:
         self._agents_client = None
-        self._agent_id: Optional[str] = None
-        self._current_model: Optional[str] = None
         self._initialized = False
         self._init_lock = asyncio.Lock()
         self._model_lock = asyncio.Lock()
         self._threads: Dict[str, AnalystThread] = {}
+        # Per-model agent cache. Previously a single mutable self._agent_id /
+        # self._current_model pair was shared across all concurrent requests
+        # -- if user A selected gpt-5 and user B selected gpt-4o-mini at
+        # nearly the same time, the model-switch code could swap the shared
+        # agent_id out from under user A's in-flight run (PR #31 review
+        # finding). Caching one agent per model, and resolving the agent_id
+        # to a local variable per request instead of reading shared mutable
+        # state, removes the race entirely and also avoids leaking a new
+        # Agent Service agent definition on every back-and-forth switch.
+        self._agents_by_model: Dict[str, str] = {}
+        self._default_model: Optional[str] = None
         self._max_init_retries = 2
         logger.info("AnalystAgent created (lazy init on first use)")
 
@@ -110,7 +119,7 @@ class AnalystAgent:
                         "[ANALYST] init attempt %d failed: %s", attempt + 1, e
                     )
                     self._agents_client = None
-                    self._agent_id = None
+                    self._agents_by_model.clear()
                     self._initialized = False
             assert last_error is not None
             raise last_error
@@ -147,59 +156,55 @@ class AnalystAgent:
         self._agents_client.enable_auto_function_calls(toolset)
 
         agent = await self._create_agent_capped(deployment, ANALYST_AGENT_INSTRUCTIONS, toolset)
-        self._agent_id = agent.id
-        self._current_model = deployment
+        self._agents_by_model[deployment] = agent.id
+        self._default_model = deployment
         self._initialized = True
         logger.info(
             "AnalystAgent initialized: agent_id=%s model=%s", agent.id, deployment
         )
 
-    async def _ensure_model(self, model: Optional[str]) -> None:
-        """Ensure the live agent definition uses ``model``, if given.
+    async def _get_or_create_agent_for_model(self, model: Optional[str]) -> str:
+        """Return the Agent Service agent_id for ``model``, creating and
+        caching it if needed.
 
-        AnalystAgent is a long-lived singleton whose Azure AI Agent Service
-        agent definition is created once (model baked in at creation time).
-        Unlike ``semantic_translator.set_model()`` -- which just resets a
-        Semantic Kernel wrapper and lazily rebuilds it -- the Agent Service
-        SDK binds ``model`` at ``create_agent()`` time, so switching models
-        means recreating the agent definition.
+        Resolves to a return value the caller stores locally, rather than
+        mutating shared instance state read later by a different request --
+        see the race-condition note on ``self._agents_by_model`` in
+        ``__init__`` for why that distinction matters.
 
-        Threads are NOT tied to a specific agent definition (a thread_id is
-        passed alongside agent_id on every run), so recreating the agent
-        preserves all existing per-session conversation threads -- this is
-        cheap (a single API call) and doesn't lose any session state.
-
-        No-op when ``model`` is falsy or already matches the live agent, so
-        the common case (no selection made, or same model as last turn)
-        costs nothing.
+        Falsy ``model`` resolves to the default deployment set up at first
+        initialization. No-op fast path (plain dict read, no lock) when the
+        agent for this model is already cached, so the common case (no
+        selection made, or same model as last turn) costs nothing.
         """
-        if not model:
-            return
         await self._ensure_initialized()
-        if model == self._current_model:
-            return
+        resolved_model = model or self._default_model
+        cached = self._agents_by_model.get(resolved_model)
+        if cached:
+            return cached
         async with self._model_lock:
-            if model == self._current_model:
-                return
+            cached = self._agents_by_model.get(resolved_model)
+            if cached:
+                return cached
             from .analyst_prompt import ANALYST_AGENT_INSTRUCTIONS
             from .tools import create_analyst_functions
             from azure.ai.agents.models import AsyncFunctionTool, AsyncToolSet  # type: ignore
 
             logger.info(
-                "[ANALYST] Switching model %s -> %s (recreating agent, threads preserved)",
-                self._current_model, model,
+                "[ANALYST] No cached agent for model=%s -- creating one (%d cached so far)",
+                resolved_model, len(self._agents_by_model),
             )
             functions = AsyncFunctionTool(create_analyst_functions())
             toolset = AsyncToolSet()
             toolset.add(functions)
             self._agents_client.enable_auto_function_calls(toolset)  # type: ignore[union-attr]
-            agent = await self._create_agent_capped(model, ANALYST_AGENT_INSTRUCTIONS, toolset)
-            self._agent_id = agent.id
-            self._current_model = model
+            agent = await self._create_agent_capped(resolved_model, ANALYST_AGENT_INSTRUCTIONS, toolset)
+            self._agents_by_model[resolved_model] = agent.id
+            return agent.id
 
     async def _create_agent_capped(self, model: str, instructions: str, toolset):
-        """Create an Agent Service agent, capping reasoning effort for gpt-5-
-        family models when possible.
+        """Create an Agent Service agent, capping reasoning effort for
+        reasoning-family models when possible.
 
         The Agents SDK's ``create_agent`` does not document a
         ``reasoning_effort`` parameter the way the plain chat.completions
@@ -210,17 +215,27 @@ class AnalystAgent:
         is unverified, so we try it and transparently fall back to
         creating the agent without it if the service/SDK rejects the
         extra kwarg. Never raises solely because of this attempt.
+
+        Per-family effort value: gpt-5-family models accept "minimal" (and
+        higher); o-series (o1/o3/o4) models only accept "low"/"medium"/
+        "high" and reject "minimal" with an HTTP 400 -- using the same
+        value for both families was a real bug (PR #31 review finding).
         """
         model_lc = (model or "").lower()
-        is_reasoning = model_lc.startswith(("gpt-5", "o1", "o3", "o4"))
-        if is_reasoning:
+        if model_lc.startswith("gpt-5"):
+            effort = "minimal"
+        elif model_lc.startswith(("o1", "o3", "o4")):
+            effort = "low"
+        else:
+            effort = None
+        if effort:
             try:
                 return await self._agents_client.create_agent(  # type: ignore[union-attr]
                     model=model,
                     name="PlanetaryExplorerAnalyst",
                     instructions=instructions,
                     toolset=toolset,
-                    reasoning_effort="minimal",
+                    reasoning_effort=effort,
                 )
             except TypeError:
                 # SDK's typed signature rejects the kwarg outright (no
@@ -235,8 +250,8 @@ class AnalystAgent:
                 # TypeError -- catch broadly here so a latency-cap attempt
                 # never breaks agent creation.
                 logger.info(
-                    "[ANALYST] reasoning_effort rejected by service (%s) -- "
-                    "creating agent without it", exc,
+                    "[ANALYST] reasoning_effort=%s rejected by service (%s) -- "
+                    "creating agent without it", effort, exc,
                 )
         return await self._agents_client.create_agent(  # type: ignore[union-attr]
             model=model,
@@ -273,10 +288,9 @@ class AnalystAgent:
 
         Args:
             model: Optional user-selected deployment name (from the
-                frontend model selector). When given and different from
-                the live agent's current model, the agent definition is
-                recreated on this model before the run -- see
-                ``_ensure_model``.
+                frontend model selector). Resolved to a cached (or newly
+                created) Agent Service agent for that model -- see
+                ``_get_or_create_agent_for_model``.
         """
         from pipeline.contracts import (
             AnalysisPlan,
@@ -287,7 +301,7 @@ class AnalystAgent:
         from .session_context import AnalystSession, clear_session, get_session, set_session
 
         started = time.time()
-        await self._ensure_model(model)
+        agent_id = await self._get_or_create_agent_for_model(model)
 
         # Populate the ContextVar so tools see the session.
         # ``use_graphrag`` / ``stac_mode`` ride on the request via the
@@ -318,7 +332,7 @@ class AnalystAgent:
         set_session(sess)
 
         try:
-            answer, tool_calls, evidence, skill_pack_id = await self._invoke_agent_service(request)
+            answer, tool_calls, evidence, skill_pack_id = await self._invoke_agent_service(request, agent_id)
         except Exception as e:
             logger.exception("[ANALYST] run failed, returning fallback response")
             answer = self._fallback_answer(request, str(e))
@@ -392,12 +406,18 @@ class AnalystAgent:
     # Agent Service invocation
     # ------------------------------------------------------------------
 
-    async def _invoke_agent_service(self, request):
-        """Send message, run, collect assistant text + tool-call evidence."""
+    async def _invoke_agent_service(self, request, agent_id: str):
+        """Send message, run, collect assistant text + tool-call evidence.
+
+        ``agent_id`` is resolved by the caller (``run()``) via
+        ``_get_or_create_agent_for_model`` into a local value, not shared
+        mutable instance state -- so concurrent requests on different
+        models can't race each other (see the note in ``__init__``).
+        """
         from azure.ai.agents.models import ListSortOrder  # type: ignore
 
         await self._ensure_initialized()
-        assert self._agents_client is not None and self._agent_id is not None
+        assert self._agents_client is not None
 
         thread = await self._get_or_create_thread(request.session_id)
 
@@ -436,7 +456,7 @@ class AnalystAgent:
                 )
                 run = await self._agents_client.runs.create_and_process(
                     thread_id=thread.thread_id,
-                    agent_id=self._agent_id,
+                    agent_id=agent_id,
                     additional_instructions=skill_instructions,
                 )
                 break

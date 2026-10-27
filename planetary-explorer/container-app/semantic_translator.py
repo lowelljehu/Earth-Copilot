@@ -3243,14 +3243,24 @@ IMPORTANT:
                 # tokens unless reasoning_effort is capped -- the same fix
                 # already validated on ContextualAgent. Classic chat models
                 # (gpt-4o*) reject reasoning_effort but accept temperature.
+                #
+                # Per-family effort value: gpt-5-family models accept
+                # "minimal"; o-series (o1/o3/o4) models only accept
+                # "low"/"medium"/"high" and reject "minimal" with an HTTP
+                # 400 (PR #31 review finding).
                 from semantic_kernel.connectors.ai.open_ai import AzureChatPromptExecutionSettings
                 _active_model_lc = (self.get_active_model() or "").lower()
-                _is_reasoning_model = _active_model_lc.startswith(("gpt-5", "o1", "o3", "o4"))
-                if _is_reasoning_model:
+                if _active_model_lc.startswith("gpt-5"):
                     execution_settings = AzureChatPromptExecutionSettings(
                         max_completion_tokens=2000,
                         temperature=1.0,  # GPT-5 only supports default temperature
                         reasoning_effort="minimal",
+                    )
+                elif _active_model_lc.startswith(("o1", "o3", "o4")):
+                    execution_settings = AzureChatPromptExecutionSettings(
+                        max_completion_tokens=2000,
+                        temperature=1.0,
+                        reasoning_effort="low",
                     )
                 else:
                     execution_settings = AzureChatPromptExecutionSettings(

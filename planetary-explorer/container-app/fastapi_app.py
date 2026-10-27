@@ -14,7 +14,7 @@ import os
 import sys
 import traceback
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
 import aiohttp
 import sys
@@ -2526,8 +2526,18 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 
 # Simple in-memory cache for /api/models -- deployment lists rarely change,
 # so avoid hitting the ARM management API on every dropdown render.
-_MODELS_CACHE: dict = {"data": None, "fetched_at": 0.0}
-_MODELS_CACHE_TTL_SECONDS = 300  # 5 minutes
+_MODELS_CACHE: dict = {"data": None, "fetched_at": 0.0, "source": None}
+_MODELS_CACHE_TTL_SECONDS = 300  # 5 minutes for a successful ARM result
+# Short TTL specifically for fallback payloads (ARM unreachable / not
+# configured) -- a transient ARM error shouldn't stick for the full 5
+# minutes once the service recovers (PR #31 review finding).
+_MODELS_FALLBACK_TTL_SECONDS = 30
+
+# Non-chat deployment model-name prefixes to exclude from the selector --
+# embedding/audio/image deployments on the same Cognitive Services account
+# would otherwise show up in the model dropdown as if they were chat models
+# (PR #31 review finding).
+_NON_CHAT_MODEL_PREFIXES = ("text-embedding-", "whisper", "dall-e", "tts-")
 
 # Static fallback used when ARM discovery isn't configured (missing env
 # vars) or the management-plane call fails for any reason -- the dropdown
@@ -2556,27 +2566,24 @@ def _friendly_model_name(model_name: str, model_version: str) -> str:
     return model_name
 
 
-@app.get("/api/models")
-async def get_available_models():
-    """Return the Azure OpenAI deployments actually available in this
-    tenant, discovered live via the ARM management API, instead of a
-    hardcoded list.
+async def _compute_available_models() -> dict:
+    """Compute (or return cached) available-models payload.
 
-    Requires AZURE_SUBSCRIPTION_ID, AZURE_RESOURCE_GROUP, and
-    AZURE_OPENAI_ACCOUNT_NAME to be set, plus the container app's managed
-    identity to have at least Reader on the Cognitive Services account
-    (a data-plane-only identity, as used for chat completions, cannot
-    list deployments -- that's a management-plane call).
-
-    Falls back to a static default list (matching prior hardcoded
-    frontend behavior) if discovery isn't configured or fails, so the
-    model selector never renders empty.
+    Factored out of the ``/api/models`` endpoint so other code paths
+    (e.g. validating a client-supplied ``model`` in ``/api/query``) can
+    reuse the exact same discovery + cache logic instead of duplicating
+    it or hard-coding a second list that could drift out of sync.
     """
     import time as _time
 
     now = _time.time()
-    if _MODELS_CACHE["data"] is not None and (now - _MODELS_CACHE["fetched_at"]) < _MODELS_CACHE_TTL_SECONDS:
-        return JSONResponse(content=_MODELS_CACHE["data"])
+    cache_ttl = (
+        _MODELS_FALLBACK_TTL_SECONDS
+        if _MODELS_CACHE["source"] == "fallback"
+        else _MODELS_CACHE_TTL_SECONDS
+    )
+    if _MODELS_CACHE["data"] is not None and (now - _MODELS_CACHE["fetched_at"]) < cache_ttl:
+        return _MODELS_CACHE["data"]
 
     subscription_id = os.getenv("AZURE_SUBSCRIPTION_ID")
     resource_group = os.getenv("AZURE_RESOURCE_GROUP")
@@ -2591,14 +2598,15 @@ async def get_available_models():
         payload = {"models": _FALLBACK_MODELS, "source": "fallback"}
         _MODELS_CACHE["data"] = payload
         _MODELS_CACHE["fetched_at"] = now
-        return JSONResponse(content=payload)
+        _MODELS_CACHE["source"] = "fallback"
+        return payload
 
+    credential = None
     try:
         from azure.identity.aio import DefaultAzureCredential as AsyncDefaultAzureCredential
 
         credential = AsyncDefaultAzureCredential()
         token = await credential.get_token("https://management.azure.com/.default")
-        await credential.close()
 
         url = (
             f"https://management.azure.com/subscriptions/{subscription_id}"
@@ -2621,6 +2629,11 @@ async def get_available_models():
             model_info = props.get("model", {})
             model_name = model_info.get("name", deployment_name)
             model_version = model_info.get("version", "")
+            # Skip non-chat deployments (embeddings, audio, image models) --
+            # they'd otherwise show up as selectable "models" in the chat
+            # dropdown even though they can't serve chat completions.
+            if (model_name or "").lower().startswith(_NON_CHAT_MODEL_PREFIXES):
+                continue
             provisioning_state = props.get("provisioningState", "")
             is_available = provisioning_state.lower() == "succeeded"
             is_default = not default_set and "mini" in deployment_name.lower()
@@ -2634,22 +2647,47 @@ async def get_available_models():
             })
 
         if not models:
-            raise RuntimeError("ARM returned zero deployments")
+            raise RuntimeError("ARM returned zero chat-capable deployments")
         if not default_set:
             models[0]["isDefault"] = True
 
         payload = {"models": models, "source": "arm"}
         _MODELS_CACHE["data"] = payload
         _MODELS_CACHE["fetched_at"] = now
+        _MODELS_CACHE["source"] = "arm"
         logger.info("[MODELS] Discovered %d live deployment(s) via ARM: %s", len(models), [m["id"] for m in models])
-        return JSONResponse(content=payload)
+        return payload
 
     except Exception as exc:  # noqa: BLE001
         logger.warning("[MODELS] ARM discovery failed (%s) -- using static fallback list", exc)
         payload = {"models": _FALLBACK_MODELS, "source": "fallback"}
         _MODELS_CACHE["data"] = payload
         _MODELS_CACHE["fetched_at"] = now
-        return JSONResponse(content=payload)
+        _MODELS_CACHE["source"] = "fallback"
+        return payload
+    finally:
+        if credential is not None:
+            await credential.close()
+
+
+@app.get("/api/models")
+async def get_available_models():
+    """Return the Azure OpenAI deployments actually available in this
+    tenant, discovered live via the ARM management API, instead of a
+    hardcoded list.
+
+    Requires AZURE_SUBSCRIPTION_ID, AZURE_RESOURCE_GROUP, and
+    AZURE_OPENAI_ACCOUNT_NAME to be set, plus the container app's managed
+    identity to have at least Reader on the Cognitive Services account
+    (a data-plane-only identity, as used for chat completions, cannot
+    list deployments -- that's a management-plane call).
+
+    Falls back to a static default list (matching prior hardcoded
+    frontend behavior) if discovery isn't configured or fails, so the
+    model selector never renders empty.
+    """
+    payload = await _compute_available_models()
+    return JSONResponse(content=payload)
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -4427,9 +4465,12 @@ async def copilot_ask(request: Request):
     try:
         from pipeline.dispatch import run_pipeline_v2
         result = await run_pipeline_v2(pipeline_body)
-    except Exception as exc:
+    except Exception:
+        # Log full exception server-side only -- do not return str(exc) to
+        # the client, which can leak internal paths/config details (PR #31
+        # review finding).
         logger.exception("[COPILOT] /api/copilot/ask pipeline failed")
-        raise HTTPException(status_code=502, detail=f"Pipeline error: {exc}")
+        raise HTTPException(status_code=502, detail="Upstream pipeline error -- please retry.")
 
     action = result.get("action")
     answer = result.get("answer") or ""
@@ -4510,9 +4551,11 @@ async def copilot_vision(request: Request):
         from location_resolver import EnhancedLocationResolver
         resolver = EnhancedLocationResolver()
         bbox = await resolver.resolve_location_to_bbox(location)
-    except Exception as exc:
+    except Exception:
+        # Log full exception server-side only -- do not return str(exc) to
+        # the client (PR #31 review finding).
         logger.exception("[COPILOT-VISION] geocoding failed")
-        raise HTTPException(status_code=502, detail=f"Geocoding error: {exc}")
+        raise HTTPException(status_code=502, detail="Geocoding error -- please retry.")
     if not bbox:
         return {
             "answer": f"I couldn't find a location matching '{location}'. Try a more specific place name.",
@@ -4532,7 +4575,7 @@ async def copilot_vision(request: Request):
             "https://planetarycomputer.microsoft.com/api/stac/v1",
             modifier=planetary_computer.sign_inplace,
         )
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         search = catalog.search(
             collections=["sentinel-2-l2a"],
             bbox=bbox,
@@ -4570,9 +4613,9 @@ async def copilot_vision(request: Request):
                 if resp.status != 200:
                     raise RuntimeError(f"preview fetch returned HTTP {resp.status}")
                 image_bytes = await resp.read()
-    except Exception as exc:
+    except Exception:
         logger.exception("[COPILOT-VISION] STAC search / image fetch failed")
-        raise HTTPException(status_code=502, detail=f"Imagery fetch error: {exc}")
+        raise HTTPException(status_code=502, detail="Imagery fetch error -- please retry.")
 
     import base64 as _b64
     imagery_base64 = _b64.b64encode(image_bytes).decode("utf-8")
@@ -4591,9 +4634,9 @@ async def copilot_vision(request: Request):
             },
             collections=["sentinel-2-l2a"],
         )
-    except Exception as exc:
+    except Exception:
         logger.exception("[COPILOT-VISION] vision analysis failed")
-        raise HTTPException(status_code=502, detail=f"Vision analysis error: {exc}")
+        raise HTTPException(status_code=502, detail="Vision analysis error -- please retry.")
 
     answer = result.get("response") or result.get("analysis") or ""
     return {
@@ -4753,6 +4796,27 @@ async def unified_query_processor(request: Request):
         session_id = req_body.get('session_id') or req_body.get('conversation_id')
         pin = req_body.get('pin') or req_body.get('vision_pin')  # Pin {lat, lng} (web-ui sends 'vision_pin')
         selected_model = req_body.get('model', 'gpt-4o-mini')  # Model selection from frontend, default to fast model
+
+        # Validate the client-supplied model against the same live-discovery
+        # list /api/models returns, instead of passing an unvalidated value
+        # straight into create_agent()/chat.completions.create() (PR #31
+        # review finding). A forged/stale model id would otherwise surface
+        # as an opaque Azure error deep in the pipeline instead of being
+        # caught here with a safe fallback.
+        try:
+            _models_payload = await _compute_available_models()
+            _valid_model_ids = {m["id"] for m in _models_payload.get("models", [])}
+            if selected_model not in _valid_model_ids:
+                logger.warning(
+                    "[BOT] Rejecting unknown model '%s' (not in %s) -- falling back to gpt-4o-mini",
+                    selected_model, sorted(_valid_model_ids),
+                )
+                selected_model = "gpt-4o-mini"
+        except Exception as _model_validate_exc:  # noqa: BLE001
+            # Never let validation itself break the request -- fail open to
+            # the existing default, matching the fail-open convention used
+            # elsewhere in this pipeline (e.g. ActionRouter).
+            logger.warning("[BOT] Model validation skipped (%s)", _model_validate_exc)
 
         # ================================================================
         # TOP-LEVEL GREETING / IDENTITY SHORT-CIRCUIT

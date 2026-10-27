@@ -114,11 +114,16 @@ class ContextualAgent:
             # questions -- measured adding ~10-15s of latency to plain
             # "what is NDVI"-style questions. Mirrors the same model-aware
             # pattern used by LoadAgent / ClarifierAgent / CollectionSelector.
+            #
+            # Per-family effort value: gpt-5-family models accept "minimal";
+            # o-series (o1/o3/o4) models only accept "low"/"medium"/"high"
+            # and reject "minimal" with an HTTP 400 (PR #31 review finding).
             model_lc = (self.deployment or "").lower()
-            is_reasoning = model_lc.startswith(("gpt-5", "o1", "o3", "o4"))
             extra: dict = {}
-            if is_reasoning:
+            if model_lc.startswith("gpt-5"):
                 extra["reasoning_effort"] = "minimal"
+            elif model_lc.startswith(("o1", "o3", "o4")):
+                extra["reasoning_effort"] = "low"
             else:
                 extra["temperature"] = 0.3
             resp = await client.chat.completions.create(
