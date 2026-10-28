@@ -118,14 +118,11 @@ class ContextualAgent:
             # Per-family effort value: gpt-5-family models accept "minimal";
             # o-series (o1/o3/o4) models only accept "low"/"medium"/"high"
             # and reject "minimal" with an HTTP 400 (PR #31 review finding).
-            model_lc = (self.deployment or "").lower()
-            extra: dict = {}
-            if model_lc.startswith("gpt-5"):
-                extra["reasoning_effort"] = "minimal"
-            elif model_lc.startswith(("o1", "o3", "o4")):
-                extra["reasoning_effort"] = "low"
-            else:
-                extra["temperature"] = 0.3
+            # Shared helper (PR #41 review: "a single reasoning_kwargs(model)
+            # helper would stop it drifting") -- see model_family.py.
+            from model_family import reasoning_effort_for_model
+            effort = reasoning_effort_for_model(self.deployment)
+            extra: dict = {"reasoning_effort": effort} if effort else {"temperature": 0.3}
             resp = await client.chat.completions.create(
                 model=self.deployment,
                 messages=messages,

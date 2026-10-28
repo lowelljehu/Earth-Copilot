@@ -128,8 +128,25 @@ class ClarifierAgent:
         # a static passthrough on error, which masked the failure.
         self.endpoint = endpoint or os.getenv("AZURE_OPENAI_ENDPOINT")
         if not self.endpoint:
+            # Compatibility fallback for deployments that only set
+            # AZURE_OPENAI_ACCOUNT_NAME (the Cognitive Services account
+            # name used elsewhere for ARM discovery, see
+            # fastapi_app._compute_available_models) instead of the full
+            # AZURE_OPENAI_ENDPOINT URL. Deliberately does NOT fall back to
+            # AZURE_AI_PROJECT_ENDPOINT -- that's an ai.azure.com Agent
+            # Service project endpoint with a different token audience and
+            # reintroduces the silent 401 this fix exists to prevent
+            # (PR #41 review finding: dropping that fallback entirely is a
+            # breaking change for environments that only set the project
+            # endpoint, so this gives them a correct-audience alternative
+            # instead of just raising).
+            _account_name = os.getenv("AZURE_OPENAI_ACCOUNT_NAME")
+            if _account_name:
+                self.endpoint = f"https://{_account_name}.cognitiveservices.azure.com/"
+        if not self.endpoint:
             raise ValueError(
-                "ClarifierAgent requires AZURE_OPENAI_ENDPOINT to be set."
+                "ClarifierAgent requires AZURE_OPENAI_ENDPOINT (or "
+                "AZURE_OPENAI_ACCOUNT_NAME) to be set."
             )
         self.api_version = api_version
         self._client: Optional[AsyncAzureOpenAI] = None
@@ -201,16 +218,14 @@ class ClarifierAgent:
             )
 
             client = self._get_client()
-            _model_lc = (_deployment or "").lower()
             # Per-family effort value: gpt-5-family models accept "minimal";
             # o-series (o1/o3/o4) models only accept "low"/"medium"/"high"
             # and reject "minimal" with an HTTP 400 (PR #31 review finding).
-            if _model_lc.startswith("gpt-5"):
-                _sampling_kwargs = {"reasoning_effort": "minimal"}
-            elif _model_lc.startswith(("o1", "o3", "o4")):
-                _sampling_kwargs = {"reasoning_effort": "low"}
-            else:
-                _sampling_kwargs = {"temperature": 0.0}
+            # Shared helper (PR #41 review: "a single reasoning_kwargs(model)
+            # helper would stop it drifting") -- see model_family.py.
+            from model_family import reasoning_effort_for_model
+            _effort = reasoning_effort_for_model(_deployment)
+            _sampling_kwargs = {"reasoning_effort": _effort} if _effort else {"temperature": 0.0}
             response = await client.chat.completions.create(
                 model=_deployment,
                 messages=[

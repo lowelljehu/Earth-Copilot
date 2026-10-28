@@ -221,13 +221,8 @@ class AnalystAgent:
         "high" and reject "minimal" with an HTTP 400 -- using the same
         value for both families was a real bug (PR #31 review finding).
         """
-        model_lc = (model or "").lower()
-        if model_lc.startswith("gpt-5"):
-            effort = "minimal"
-        elif model_lc.startswith(("o1", "o3", "o4")):
-            effort = "low"
-        else:
-            effort = None
+        from model_family import reasoning_effort_for_model
+        effort = reasoning_effort_for_model(model)
         if effort:
             try:
                 return await self._agents_client.create_agent(  # type: ignore[union-attr]

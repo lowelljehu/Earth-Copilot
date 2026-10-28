@@ -2555,11 +2555,30 @@ def _fallback_models_with_configured_deployment() -> list:
     the 3 hardcoded ids). Without this, a legitimate custom deployment name
     would be silently rejected by model validation whenever ARM discovery
     is unavailable (PR #41 review finding).
+
+    When a deployment name IS configured, it is marked isDefault=True (and
+    the static list's gpt-4o-mini entry is demoted) -- this environment is
+    actually running that deployment, so the model-validation fallback
+    should rewrite invalid/missing model ids to it, not to a model that may
+    not even be provisioned in this tenant (PR #41 second-round review
+    finding: previously gpt-4o-mini stayed isDefault even when the only
+    real deployment was the configured custom one).
     """
     configured = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-    models = list(_FALLBACK_MODELS)
-    if configured and configured not in {m["id"] for m in models}:
-        models.append({"id": configured, "name": configured, "isAvailable": True})
+    models = [dict(m) for m in _FALLBACK_MODELS]
+    if configured:
+        for m in models:
+            m["isDefault"] = False
+        existing = next((m for m in models if m["id"] == configured), None)
+        if existing is not None:
+            existing["isDefault"] = True
+        else:
+            models.append({
+                "id": configured,
+                "name": configured,
+                "isDefault": True,
+                "isAvailable": True,
+            })
     return models
 
 
@@ -4590,30 +4609,35 @@ async def copilot_vision(request: Request):
             modifier=planetary_computer.sign_inplace,
         )
         now = datetime.now(timezone.utc)
-        search = catalog.search(
-            collections=["sentinel-2-l2a"],
-            bbox=bbox,
-            datetime=f"{(now - timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%SZ')}/{now.strftime('%Y-%m-%dT%H:%M:%SZ')}",
-            query={"eo:cloud_cover": {"lt": 20}},
-            limit=20,
-        )
-        items = list(search.items())
-        if not items:
-            search = catalog.search(
+
+        def _search_sentinel2(start_days: int, cloud_lt: int, limit: int):
+            # pystac_client's search()/items() perform synchronous network
+            # I/O; running them directly inside this async def would block
+            # the event loop for the duration of each STAC query (PR #41
+            # review finding). Offloaded to a worker thread via
+            # asyncio.to_thread at the call sites below.
+            _search = catalog.search(
                 collections=["sentinel-2-l2a"],
                 bbox=bbox,
-                datetime=f"{(now - timedelta(days=60)).strftime('%Y-%m-%dT%H:%M:%SZ')}/{now.strftime('%Y-%m-%dT%H:%M:%SZ')}",
-                query={"eo:cloud_cover": {"lt": 30}},
-                limit=10,
+                datetime=f"{(now - timedelta(days=start_days)).strftime('%Y-%m-%dT%H:%M:%SZ')}/{now.strftime('%Y-%m-%dT%H:%M:%SZ')}",
+                query={"eo:cloud_cover": {"lt": cloud_lt}},
+                limit=limit,
             )
-            items = list(search.items())
+            return list(_search.items())
+
+        items = await asyncio.to_thread(_search_sentinel2, 30, 20, 20)
+        if not items:
+            items = await asyncio.to_thread(_search_sentinel2, 60, 30, 10)
         if not items:
             return {
                 "answer": f"I couldn't find recent, mostly-clear Sentinel-2 imagery for {location}. Try a different location or check back later.",
                 "needs_clarification": False,
                 "options": [],
             }
-        item = sorted(items, key=lambda x: x.datetime, reverse=True)[0]
+        # item.datetime can be None for some STAC items -- sort with a
+        # fallback so this doesn't raise a TypeError comparing None to a
+        # real datetime (PR #41 review finding).
+        item = sorted(items, key=lambda x: x.datetime or datetime.min.replace(tzinfo=timezone.utc), reverse=True)[0]
 
         preview_url = (
             f"https://planetarycomputer.microsoft.com/api/data/v1/item/preview.png"
@@ -4818,6 +4842,7 @@ async def unified_query_processor(request: Request):
         # as an opaque Azure error deep in the pipeline instead of being
         # caught here with a safe fallback.
         try:
+            from model_family import resolve_fallback_model_id
             _models_payload = await _compute_available_models()
             _valid_models = _models_payload.get("models", [])
             _valid_model_ids = {m["id"] for m in _valid_models}
@@ -4826,11 +4851,9 @@ async def unified_query_processor(request: Request):
                 # isDefault (works in both ARM and static-fallback modes,
                 # since both always set exactly one isDefault=True), rather
                 # than a hardcoded id that may not exist in this tenant/mode
-                # (PR #41 review finding).
-                _default_entry = next((m for m in _valid_models if m.get("isDefault")), None)
-                _fallback_model = _default_entry["id"] if _default_entry else (
-                    _valid_models[0]["id"] if _valid_models else "gpt-4o-mini"
-                )
+                # (PR #41 review finding). Extracted to model_family.py so
+                # this precedence is independently unit-tested.
+                _fallback_model = resolve_fallback_model_id(_valid_models)
                 logger.warning(
                     "[BOT] Rejecting unknown model '%s' (not in %s) -- falling back to '%s'",
                     selected_model, sorted(_valid_model_ids), _fallback_model,
@@ -4844,10 +4867,21 @@ async def unified_query_processor(request: Request):
             # run_pipeline_v2, so mutating it here is sufficient).
             req_body['model'] = selected_model
         except Exception as _model_validate_exc:  # noqa: BLE001
-            # Never let validation itself break the request -- fail open to
-            # the existing default, matching the fail-open convention used
-            # elsewhere in this pipeline (e.g. ActionRouter).
-            logger.warning("[BOT] Model validation skipped (%s)", _model_validate_exc)
+            # Never let validation itself break the request, but ALSO never
+            # leave an unvalidated client-supplied model in req_body -- that
+            # would silently reopen the exact bypass this fix exists to
+            # close (PR #41 second-round review finding: fail-open was
+            # failing open with the attacker-controlled value still intact).
+            # Fall back to whatever this environment is actually configured
+            # to run, same precedence _fallback_models_with_configured_deployment()
+            # uses: a configured custom deployment name, else the static
+            # default.
+            selected_model = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") or "gpt-4o-mini"
+            req_body['model'] = selected_model
+            logger.warning(
+                "[BOT] Model validation failed (%s) -- forcing fallback to '%s'",
+                _model_validate_exc, selected_model,
+            )
 
         # ================================================================
         # TOP-LEVEL GREETING / IDENTITY SHORT-CIRCUIT

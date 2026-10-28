@@ -3247,16 +3247,25 @@ IMPORTANT:
                 # Per-family effort value: gpt-5-family models accept
                 # "minimal"; o-series (o1/o3/o4) models only accept
                 # "low"/"medium"/"high" and reject "minimal" with an HTTP
-                # 400 (PR #31 review finding).
-                from semantic_kernel.connectors.ai.open_ai import AzureChatPromptExecutionSettings
-                _active_model_lc = (self.get_active_model() or "").lower()
-                if _active_model_lc.startswith("gpt-5"):
+                # 400 (PR #31 review finding). AzureChatPromptExecutionSettings
+                # is already imported at module level (see top of file) --
+                # no local import needed here (PR #41 review finding: a
+                # local import of the same name would make it function-local
+                # for the whole function, risking UnboundLocalError if used
+                # earlier in the function; removed to avoid any ambiguity).
+                # Effort/temperature mapping uses the shared helper (PR #41
+                # review: "a single reasoning_kwargs(model) helper would
+                # stop it drifting") -- see model_family.py.
+                from model_family import reasoning_effort_for_model
+                _active_model = self.get_active_model()
+                _effort = reasoning_effort_for_model(_active_model)
+                if _effort == "minimal":
                     execution_settings = AzureChatPromptExecutionSettings(
                         max_completion_tokens=2000,
                         temperature=1.0,  # GPT-5 only supports default temperature
                         reasoning_effort="minimal",
                     )
-                elif _active_model_lc.startswith(("o1", "o3", "o4")):
+                elif _effort == "low":
                     execution_settings = AzureChatPromptExecutionSettings(
                         max_completion_tokens=2000,
                         temperature=1.0,
