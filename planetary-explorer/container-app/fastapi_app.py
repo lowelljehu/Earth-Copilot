@@ -2549,6 +2549,20 @@ _FALLBACK_MODELS = [
 ]
 
 
+def _fallback_models_with_configured_deployment() -> list:
+    """Static fallback list, plus whatever AZURE_OPENAI_DEPLOYMENT_NAME is
+    actually configured to in this environment (if it isn't already one of
+    the 3 hardcoded ids). Without this, a legitimate custom deployment name
+    would be silently rejected by model validation whenever ARM discovery
+    is unavailable (PR #41 review finding).
+    """
+    configured = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+    models = list(_FALLBACK_MODELS)
+    if configured and configured not in {m["id"] for m in models}:
+        models.append({"id": configured, "name": configured, "isAvailable": True})
+    return models
+
+
 def _friendly_model_name(model_name: str, model_version: str) -> str:
     """Best-effort human-readable label for a deployment.
 
@@ -2595,7 +2609,7 @@ async def _compute_available_models() -> dict:
             "AZURE_SUBSCRIPTION_ID/AZURE_RESOURCE_GROUP/AZURE_OPENAI_ACCOUNT_NAME) "
             "-- using static fallback list"
         )
-        payload = {"models": _FALLBACK_MODELS, "source": "fallback"}
+        payload = {"models": _fallback_models_with_configured_deployment(), "source": "fallback"}
         _MODELS_CACHE["data"] = payload
         _MODELS_CACHE["fetched_at"] = now
         _MODELS_CACHE["source"] = "fallback"
@@ -2660,7 +2674,7 @@ async def _compute_available_models() -> dict:
 
     except Exception as exc:  # noqa: BLE001
         logger.warning("[MODELS] ARM discovery failed (%s) -- using static fallback list", exc)
-        payload = {"models": _FALLBACK_MODELS, "source": "fallback"}
+        payload = {"models": _fallback_models_with_configured_deployment(), "source": "fallback"}
         _MODELS_CACHE["data"] = payload
         _MODELS_CACHE["fetched_at"] = now
         _MODELS_CACHE["source"] = "fallback"
@@ -4579,7 +4593,7 @@ async def copilot_vision(request: Request):
         search = catalog.search(
             collections=["sentinel-2-l2a"],
             bbox=bbox,
-            datetime=f"{(now - timedelta(days=30)).isoformat()}Z/{now.isoformat()}Z",
+            datetime=f"{(now - timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%SZ')}/{now.strftime('%Y-%m-%dT%H:%M:%SZ')}",
             query={"eo:cloud_cover": {"lt": 20}},
             limit=20,
         )
@@ -4588,7 +4602,7 @@ async def copilot_vision(request: Request):
             search = catalog.search(
                 collections=["sentinel-2-l2a"],
                 bbox=bbox,
-                datetime=f"{(now - timedelta(days=60)).isoformat()}Z/{now.isoformat()}Z",
+                datetime=f"{(now - timedelta(days=60)).strftime('%Y-%m-%dT%H:%M:%SZ')}/{now.strftime('%Y-%m-%dT%H:%M:%SZ')}",
                 query={"eo:cloud_cover": {"lt": 30}},
                 limit=10,
             )
@@ -4805,13 +4819,30 @@ async def unified_query_processor(request: Request):
         # caught here with a safe fallback.
         try:
             _models_payload = await _compute_available_models()
-            _valid_model_ids = {m["id"] for m in _models_payload.get("models", [])}
+            _valid_models = _models_payload.get("models", [])
+            _valid_model_ids = {m["id"] for m in _valid_models}
             if selected_model not in _valid_model_ids:
-                logger.warning(
-                    "[BOT] Rejecting unknown model '%s' (not in %s) -- falling back to gpt-4o-mini",
-                    selected_model, sorted(_valid_model_ids),
+                # Fall back to whichever entry the live list marks as
+                # isDefault (works in both ARM and static-fallback modes,
+                # since both always set exactly one isDefault=True), rather
+                # than a hardcoded id that may not exist in this tenant/mode
+                # (PR #41 review finding).
+                _default_entry = next((m for m in _valid_models if m.get("isDefault")), None)
+                _fallback_model = _default_entry["id"] if _default_entry else (
+                    _valid_models[0]["id"] if _valid_models else "gpt-4o-mini"
                 )
-                selected_model = "gpt-4o-mini"
+                logger.warning(
+                    "[BOT] Rejecting unknown model '%s' (not in %s) -- falling back to '%s'",
+                    selected_model, sorted(_valid_model_ids), _fallback_model,
+                )
+                selected_model = _fallback_model
+            # Write the validated value back into the shared request body so
+            # every downstream consumer reading body.get("model") directly
+            # (e.g. pipeline.layer1_agents.AnalyzeAgent) sees the corrected
+            # value instead of bypassing this validation (PR #41 review
+            # finding -- req_body is the same dict passed into
+            # run_pipeline_v2, so mutating it here is sufficient).
+            req_body['model'] = selected_model
         except Exception as _model_validate_exc:  # noqa: BLE001
             # Never let validation itself break the request -- fail open to
             # the existing default, matching the fail-open convention used

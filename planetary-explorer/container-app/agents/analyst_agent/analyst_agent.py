@@ -301,7 +301,6 @@ class AnalystAgent:
         from .session_context import AnalystSession, clear_session, get_session, set_session
 
         started = time.time()
-        agent_id = await self._get_or_create_agent_for_model(model)
 
         # Populate the ContextVar so tools see the session.
         # ``use_graphrag`` / ``stac_mode`` ride on the request via the
@@ -332,6 +331,12 @@ class AnalystAgent:
         set_session(sess)
 
         try:
+            # Resolved inside the try so a bad/unavailable deployment (e.g.
+            # Agent Service rejects the model, transient failure) degrades
+            # to _fallback_answer below instead of raising out of run() as
+            # an uncaught 500 (PR #41 review finding: this previously ran
+            # before the try: block).
+            agent_id = await self._get_or_create_agent_for_model(model)
             answer, tool_calls, evidence, skill_pack_id = await self._invoke_agent_service(request, agent_id)
         except Exception as e:
             logger.exception("[ANALYST] run failed, returning fallback response")
